@@ -1,0 +1,2231 @@
+=== FULL CODEBASE EXPORT: lib ===
+
+main.dart
+````text
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'app.dart';
+import 'core/alarm_service.dart';
+import 'core/audio_handler.dart';
+import 'core/models.dart';
+
+// 1. Define the navigatorKey
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+// 2. Only ONE main function
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  final prefs = await SharedPreferences.getInstance();
+  final rawSettings = prefs.getString('app_settings_v1');
+  if (rawSettings != null) {
+    final parts = rawSettings.split('|');
+    if (parts.length == 3) {
+      settingsNotifier.value = AppSettings(
+        themeMode: ThemeMode.values[(int.tryParse(parts[0]) ?? 0)
+            .clamp(0, ThemeMode.values.length - 1)],
+        defaultSnoozeMinutes: int.tryParse(parts[1]) ?? 10,
+        defaultSleepMinutes: int.tryParse(parts[2]) ?? 30,
+      );
+    }
+  }
+
+  await initAudioHandler();
+  await alarmService.init(navigatorKey);
+
+  runApp(const MusicAlarmApp());
+}
+````
+--------------------------------------------------------------------------------
+
+app.dart
+````text
+import 'package:flutter/material.dart';
+import 'main.dart'; // To access navigatorKey
+
+// Import your actual screens here:
+import 'screens/alarm_screen.dart'; 
+// import 'screens/library_screen.dart';
+// import 'screens/player_screen.dart';
+
+class MusicAlarmApp extends StatelessWidget {
+  const MusicAlarmApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Music Alarm',
+      navigatorKey: navigatorKey,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+      ),
+      // Replace the placeholder Scaffold with your actual screen:
+      home: const MainNavigation(), 
+    );
+  }
+}
+````
+--------------------------------------------------------------------------------
+
+core/models.dart
+````text
+import 'package:audio_service/audio_service.dart';
+import 'package:flutter/material.dart';
+
+/// Shared in-memory scanned tracks & app settings (no Drift/Riverpod).
+final ValueNotifier<List<Track>> libraryTracks = ValueNotifier<List<Track>>([]);
+final ValueNotifier<AppSettings> settingsNotifier =
+    ValueNotifier<AppSettings>(const AppSettings());
+
+enum LibrarySort { title, artist, dateAdded }
+
+class Track {
+  final String id;
+  final String path;
+  final String title;
+  final String artist;
+  final String album;
+  final int durationMs;
+  final int dateAddedMs;
+
+  const Track({
+    required this.id,
+    required this.path,
+    required this.title,
+    required this.artist,
+    required this.album,
+    required this.durationMs,
+    required this.dateAddedMs,
+  });
+
+  Duration get duration => Duration(milliseconds: durationMs);
+
+  MediaItem toMediaItem() => MediaItem(
+        id: id,
+        title: title,
+        artist: artist,
+        album: album,
+        duration: durationMs > 0 ? duration : null,
+        extras: {'path': path},
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'path': path,
+        'title': title,
+        'artist': artist,
+        'album': album,
+        'durationMs': durationMs,
+        'dateAddedMs': dateAddedMs,
+      };
+
+  factory Track.fromJson(Map<String, dynamic> json) => Track(
+        id: json['id'] as String,
+        path: json['path'] as String,
+        title: json['title'] as String,
+        artist: json['artist'] as String,
+        album: json['album'] as String? ?? 'Unknown Album',
+        durationMs: json['durationMs'] as int? ?? 0,
+        dateAddedMs: json['dateAddedMs'] as int? ?? 0,
+      );
+}
+
+class Alarm {
+  final int id;
+  final int hour;
+  final int minute;
+  final String label;
+  final bool enabled;
+  final List<int> repeatDays; // 1=Mon .. 7=Sun; empty = Once
+  final bool vibrate;
+  final int snoozeMinutes;
+  final bool fadeIn;
+  final String? soundPath; // null = default alarm sound
+
+  const Alarm({
+    required this.id,
+    required this.hour,
+    required this.minute,
+    this.label = '',
+    this.enabled = true,
+    this.repeatDays = const [],
+    this.vibrate = true,
+    this.snoozeMinutes = 10,
+    this.fadeIn = true,
+    this.soundPath,
+  });
+
+  Alarm copyWith({
+    int? id,
+    int? hour,
+    int? minute,
+    String? label,
+    bool? enabled,
+    List<int>? repeatDays,
+    bool? vibrate,
+    int? snoozeMinutes,
+    bool? fadeIn,
+    String? soundPath,
+    bool clearSoundPath = false,
+  }) {
+    return Alarm(
+      id: id ?? this.id,
+      hour: hour ?? this.hour,
+      minute: minute ?? this.minute,
+      label: label ?? this.label,
+      enabled: enabled ?? this.enabled,
+      repeatDays: repeatDays ?? this.repeatDays,
+      vibrate: vibrate ?? this.vibrate,
+      snoozeMinutes: snoozeMinutes ?? this.snoozeMinutes,
+      fadeIn: fadeIn ?? this.fadeIn,
+      soundPath: clearSoundPath ? null : (soundPath ?? this.soundPath),
+    );
+  }
+
+  DateTime nextTriggerTime([DateTime? from]) {
+    final now = from ?? DateTime.now();
+    var candidate = DateTime(now.year, now.month, now.day, hour, minute);
+
+    if (repeatDays.isEmpty) {
+      if (!candidate.isAfter(now)) {
+        candidate = candidate.add(const Duration(days: 1));
+      }
+      return candidate;
+    }
+
+    for (int offset = 0; offset <= 7; offset++) {
+      final day = candidate.add(Duration(days: offset));
+      if (repeatDays.contains(day.weekday) && day.isAfter(now)) {
+        return day;
+      }
+    }
+    return candidate.add(const Duration(days: 1));
+  }
+
+  String formattedTime(BuildContext context) {
+    return TimeOfDay(hour: hour, minute: minute).format(context);
+  }
+
+  String get repeatSummary {
+    if (repeatDays.isEmpty) return 'Once';
+    if (repeatDays.length == 7) return 'Daily';
+    const names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    final sorted = [...repeatDays]..sort();
+    return sorted.map((d) => names[d - 1]).join(', ');
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'hour': hour,
+        'minute': minute,
+        'label': label,
+        'enabled': enabled,
+        'repeatDays': repeatDays,
+        'vibrate': vibrate,
+        'snoozeMinutes': snoozeMinutes,
+        'fadeIn': fadeIn,
+        'soundPath': soundPath,
+      };
+
+  factory Alarm.fromJson(Map<String, dynamic> json) => Alarm(
+        id: json['id'] as int,
+        hour: json['hour'] as int,
+        minute: json['minute'] as int,
+        label: json['label'] as String? ?? '',
+        enabled: json['enabled'] as bool? ?? true,
+        repeatDays: (json['repeatDays'] as List<dynamic>? ?? [])
+            .map((e) => e as int)
+            .toList(),
+        vibrate: json['vibrate'] as bool? ?? true,
+        snoozeMinutes: json['snoozeMinutes'] as int? ?? 10,
+        fadeIn: json['fadeIn'] as bool? ?? true,
+        soundPath: json['soundPath'] as String?,
+      );
+}
+
+class SleepTimerPreset {
+  final String label;
+  final Duration duration;
+
+  const SleepTimerPreset(this.label, this.duration);
+
+  static const List<SleepTimerPreset> presets = [
+    SleepTimerPreset('15m', Duration(minutes: 15)),
+    SleepTimerPreset('30m', Duration(minutes: 30)),
+    SleepTimerPreset('1h', Duration(hours: 1)),
+    SleepTimerPreset('2h', Duration(hours: 2)),
+    SleepTimerPreset('3h', Duration(hours: 3)),
+  ];
+}
+
+class AppSettings {
+  final ThemeMode themeMode;
+  final int defaultSnoozeMinutes;
+  final int defaultSleepMinutes;
+
+  const AppSettings({
+    this.themeMode = ThemeMode.system,
+    this.defaultSnoozeMinutes = 10,
+    this.defaultSleepMinutes = 30,
+  });
+
+  AppSettings copyWith({
+    ThemeMode? themeMode,
+    int? defaultSnoozeMinutes,
+    int? defaultSleepMinutes,
+  }) =>
+      AppSettings(
+        themeMode: themeMode ?? this.themeMode,
+        defaultSnoozeMinutes:
+            defaultSnoozeMinutes ?? this.defaultSnoozeMinutes,
+        defaultSleepMinutes: defaultSleepMinutes ?? this.defaultSleepMinutes,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'themeMode': themeMode.index,
+        'defaultSnoozeMinutes': defaultSnoozeMinutes,
+        'defaultSleepMinutes': defaultSleepMinutes,
+      };
+
+  factory AppSettings.fromJson(Map<String, dynamic> json) => AppSettings(
+        themeMode: ThemeMode.values[(json['themeMode'] as int? ?? 0)
+            .clamp(0, ThemeMode.values.length - 1)],
+        defaultSnoozeMinutes: json['defaultSnoozeMinutes'] as int? ?? 10,
+        defaultSleepMinutes: json['defaultSleepMinutes'] as int? ?? 30,
+      );
+}
+````
+--------------------------------------------------------------------------------
+
+core/audio_handler.dart
+````text
+import 'dart:async';
+
+import 'package:audio_service/audio_service.dart';
+import 'package:flutter/foundation.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+import 'models.dart';
+
+late final AppAudioHandler audioHandler;
+
+Future<void> initAudioHandler() async {
+  audioHandler = await AudioService.init(
+    builder: () => AppAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.example.music_alarm_app.audio',
+      androidNotificationChannelName: 'Music Playback',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
+    ),
+  );
+}
+
+class AppAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
+  final AudioPlayer player = AudioPlayer();
+
+  final ValueNotifier<List<Track>> currentTracks = ValueNotifier([]);
+  final ValueNotifier<Duration?> sleepRemaining = ValueNotifier(null);
+  final ValueNotifier<bool> stopAfterCurrent = ValueNotifier(false);
+  final ValueNotifier<bool> shuffleEnabled = ValueNotifier(false);
+  final ValueNotifier<LoopMode> loopMode = ValueNotifier(LoopMode.off);
+
+  Timer? _sleepTimer;
+  bool _askedNotificationOnPlay = false;
+  int? _lastIndex;
+
+  AppAudioHandler() {
+    player.playbackEventStream.map(_transformEvent).pipe(playbackState);
+
+    player.currentIndexStream.listen((index) async {
+      final list = currentTracks.value;
+      if (index != null && index >= 0 && index < list.length) {
+        if (stopAfterCurrent.value && _lastIndex != null && _lastIndex != index) {
+          stopAfterCurrent.value = false;
+          await pause();
+        }
+        _lastIndex = index;
+        mediaItem.add(list[index].toMediaItem());
+      }
+    });
+
+    player.processingStateStream.listen((state) {
+      if (state == ProcessingState.completed && stopAfterCurrent.value) {
+        stopAfterCurrent.value = false;
+      }
+    });
+  }
+
+  PlaybackState _transformEvent(PlaybackEvent event) {
+    return PlaybackState(
+      controls: [
+        MediaControl.skipToPrevious,
+        if (player.playing) MediaControl.pause else MediaControl.play,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {
+        MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
+      },
+      androidCompactActionIndices: const [0, 1, 2],
+      processingState: const {
+        ProcessingState.idle: AudioProcessingState.idle,
+        ProcessingState.loading: AudioProcessingState.loading,
+        ProcessingState.buffering: AudioProcessingState.buffering,
+        ProcessingState.ready: AudioProcessingState.ready,
+        ProcessingState.completed: AudioProcessingState.completed,
+      }[player.processingState]!,
+      playing: player.playing,
+      updatePosition: player.position,
+      bufferedPosition: player.bufferedPosition,
+      speed: player.speed,
+      queueIndex: event.currentIndex,
+      shuffleMode: shuffleEnabled.value
+          ? AudioServiceShuffleMode.all
+          : AudioServiceShuffleMode.none,
+      repeatMode: const {
+        LoopMode.off: AudioServiceRepeatMode.none,
+        LoopMode.all: AudioServiceRepeatMode.all,
+        LoopMode.one: AudioServiceRepeatMode.one,
+      }[loopMode.value]!,
+    );
+  }
+
+  Future<void> _ensureNotificationPermission() async {
+    if (_askedNotificationOnPlay) return;
+    _askedNotificationOnPlay = true;
+    if (await Permission.notification.isDenied) {
+      await Permission.notification.request();
+    }
+  }
+
+  Future<void> setQueueAndPlay(List<Track> tracks, int initialIndex) async {
+    if (tracks.isEmpty) return;
+    await _ensureNotificationPermission();
+
+    _lastIndex = null;
+    currentTracks.value = List<Track>.from(tracks);
+    queue.add(tracks.map((t) => t.toMediaItem()).toList());
+
+    final sources = tracks.map((t) => AudioSource.file(t.path)).toList();
+    await player.setAudioSources(
+      sources,
+      initialIndex: initialIndex.clamp(0, tracks.length - 1),
+      initialPosition: Duration.zero,
+    );
+    mediaItem.add(tracks[initialIndex.clamp(0, tracks.length - 1)].toMediaItem());
+    await play();
+  }
+
+  Future<void> playNext(Track track) async {
+    final list = [...currentTracks.value];
+    if (list.isEmpty) {
+      await setQueueAndPlay([track], 0);
+      return;
+    }
+    final insertIdx = (player.currentIndex ?? 0) + 1;
+    list.insert(insertIdx, track);
+    currentTracks.value = list;
+    queue.add(list.map((t) => t.toMediaItem()).toList());
+    await player.insertAudioSource(insertIdx, AudioSource.file(track.path));
+  }
+
+  Future<void> addToQueue(Track track) async {
+    final list = [...currentTracks.value];
+    if (list.isEmpty) {
+      await setQueueAndPlay([track], 0);
+      return;
+    }
+    list.add(track);
+    currentTracks.value = list;
+    queue.add(list.map((t) => t.toMediaItem()).toList());
+    await player.addAudioSource(AudioSource.file(track.path));
+  }
+
+  Future<void> reorderQueue(int oldIndex, int newIndex) async {
+    final list = [...currentTracks.value];
+    if (oldIndex < 0 || oldIndex >= list.length) return;
+    if (oldIndex < newIndex) newIndex -= 1;
+    if (newIndex < 0 || newIndex >= list.length) return;
+
+    final item = list.removeAt(oldIndex);
+    list.insert(newIndex, item);
+    currentTracks.value = list;
+    queue.add(list.map((t) => t.toMediaItem()).toList());
+    await player.moveAudioSource(oldIndex, newIndex);
+  }
+
+  Future<void> toggleShuffle() async {
+    final next = !shuffleEnabled.value;
+    shuffleEnabled.value = next;
+    await player.setShuffleModeEnabled(next);
+    if (next) await player.shuffle();
+  }
+
+  Future<void> cycleRepeatMode() async {
+    final next = switch (loopMode.value) {
+      LoopMode.off => LoopMode.all,
+      LoopMode.all => LoopMode.one,
+      LoopMode.one => LoopMode.off,
+    };
+    loopMode.value = next;
+    await player.setLoopMode(next);
+  }
+
+  // Sleep timer controls
+  void startSleepTimer(Duration duration) {
+    _sleepTimer?.cancel();
+    sleepRemaining.value = duration;
+    _sleepTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+      final rem = sleepRemaining.value;
+      if (rem == null) {
+        timer.cancel();
+        return;
+      }
+      final next = rem - const Duration(seconds: 1);
+      if (next <= Duration.zero) {
+        timer.cancel();
+        sleepRemaining.value = null;
+        stopAfterCurrent.value = false;
+        await pause();
+      } else {
+        sleepRemaining.value = next;
+      }
+    });
+  }
+
+  void extendSleepTimer(Duration extra) {
+    final current = sleepRemaining.value;
+    if (current != null) {
+      sleepRemaining.value = current + extra;
+    } else {
+      startSleepTimer(extra);
+    }
+  }
+
+  void cancelSleepTimer() {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    sleepRemaining.value = null;
+    stopAfterCurrent.value = false;
+  }
+
+  void toggleStopAfterCurrent() {
+    stopAfterCurrent.value = !stopAfterCurrent.value;
+  }
+
+  @override
+  Future<void> play() async {
+    await _ensureNotificationPermission();
+    await player.play();
+  }
+
+  @override
+  Future<void> pause() => player.pause();
+
+  @override
+  Future<void> stop() async {
+    cancelSleepTimer();
+    await player.stop();
+    await super.stop();
+  }
+
+  @override
+  Future<void> seek(Duration position) => player.seek(position);
+
+  @override
+  Future<void> skipToNext() => player.seekToNext();
+
+  @override
+  Future<void> skipToPrevious() async {
+    if (player.position > const Duration(seconds: 3)) {
+      await player.seek(Duration.zero);
+    } else {
+      await player.seekToPrevious();
+    }
+  }
+
+  @override
+  Future<void> skipToQueueItem(int index) async {
+    await player.seek(Duration.zero, index: index);
+    await play();
+  }
+}
+````
+--------------------------------------------------------------------------------
+
+core/alarm_service.dart
+````text
+import 'dart:async';
+import 'dart:convert';
+import 'dart:isolate';
+import 'dart:ui';
+
+import 'package:android_alarm_manager_plus/android_alarm_manager_plus.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'models.dart';
+
+const String _alarmsPrefsKey = 'saved_alarms_v1';
+const String _alarmChannelId = 'alarm_ring_channel';
+const String _alarmPortName = 'music_alarm_ring_port';
+
+final AlarmService alarmService = AlarmService();
+
+@pragma('vm:entry-point')
+void notificationTapBackground(NotificationResponse response) {
+  // Handled when app brings itself to foreground or via launch details.
+}
+
+@pragma('vm:entry-point')
+Future<void> alarmCallback(int id, Map<String, dynamic> params) async {
+  DartPluginRegistrant.ensureInitialized();
+  WidgetsFlutterBinding.ensureInitialized();
+
+  final plugin = FlutterLocalNotificationsPlugin();
+  const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+  await plugin.initialize(
+    settings: const InitializationSettings(android: androidInit),
+  );
+
+  final alarm = Alarm.fromJson(params);
+  final title = alarm.label.isEmpty ? 'Alarm' : alarm.label;
+  final body =
+      '${alarm.hour.toString().padLeft(2, '0')}:${alarm.minute.toString().padLeft(2, '0')}';
+
+  final details = AndroidNotificationDetails(
+    _alarmChannelId,
+    'Alarms',
+    channelDescription: 'Full-screen alarm alerts',
+    importance: Importance.max,
+    priority: Priority.max,
+    fullScreenIntent: true,
+    category: AndroidNotificationCategory.alarm,
+    audioAttributesUsage: AudioAttributesUsage.alarm,
+    ongoing: true,
+    autoCancel: false,
+    enableVibration: alarm.vibrate,
+    actions: const [
+      AndroidNotificationAction('stop', 'Stop', showsUserInterface: true),
+      AndroidNotificationAction('snooze', 'Snooze', showsUserInterface: true),
+    ],
+  );
+
+  await plugin.show(
+    id: id,
+    title: title,
+    body: body,
+    notificationDetails: NotificationDetails(android: details),
+    payload: jsonEncode(params),
+  );
+
+  // If the main UI isolate is alive, notify it immediately.
+  final SendPort? sendPort = IsolateNameServer.lookupPortByName(_alarmPortName);
+  sendPort?.send(jsonEncode(params));
+}
+
+class AlarmService {
+  final ValueNotifier<List<Alarm>> alarms = ValueNotifier([]);
+  final ValueNotifier<Alarm?> ringingAlarm = ValueNotifier(null);
+
+  final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
+  final AudioPlayer _ringPlayer = AudioPlayer();
+
+  GlobalKey<NavigatorState>? _navKey;
+  ReceivePort? _receivePort;
+  Timer? _fadeTimer;
+  Timer? _vibrateTimer;
+
+  Future<void> init(GlobalKey<NavigatorState> navKey) async {
+    _navKey = navKey;
+    await AndroidAlarmManager.initialize();
+
+    _receivePort?.close();
+    _receivePort = ReceivePort();
+    IsolateNameServer.removePortNameMapping(_alarmPortName);
+    IsolateNameServer.registerPortWithName(_receivePort!.sendPort, _alarmPortName);
+    _receivePort!.listen((message) {
+      if (message is String) {
+        final alarm = Alarm.fromJson(jsonDecode(message) as Map<String, dynamic>);
+        startRinging(alarm);
+      }
+    });
+
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    await _notifications.initialize(
+      settings: const InitializationSettings(android: androidInit),
+      onDidReceiveNotificationResponse: _onNotificationResponse,
+      onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
+    );
+
+    const channel = AndroidNotificationChannel(
+      _alarmChannelId,
+      'Alarms',
+      description: 'Full-screen alarm alerts',
+      importance: Importance.max,
+      audioAttributesUsage: AudioAttributesUsage.alarm,
+    );
+    await _notifications
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(channel);
+
+    await loadAlarms();
+    await _rearmEnabledAlarms();
+
+    final launchDetails =
+        await _notifications.getNotificationAppLaunchDetails();
+    if (launchDetails?.didNotificationLaunchApp ?? false) {
+      final response = launchDetails!.notificationResponse;
+      if (response != null) {
+        _onNotificationResponse(response);
+      }
+    }
+  }
+
+  void _onNotificationResponse(NotificationResponse response) {
+    final payload = response.payload;
+    if (payload == null || payload.isEmpty) return;
+    final alarm = Alarm.fromJson(jsonDecode(payload) as Map<String, dynamic>);
+
+    if (response.actionId == 'stop') {
+      ringingAlarm.value = alarm;
+      stopRinging();
+    } else if (response.actionId == 'snooze') {
+      ringingAlarm.value = alarm;
+      snoozeRinging();
+    } else {
+      startRinging(alarm);
+    }
+  }
+
+  Future<void> loadAlarms() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_alarmsPrefsKey);
+    if (raw == null) {
+      alarms.value = [];
+      return;
+    }
+    final list = (jsonDecode(raw) as List<dynamic>)
+        .map((e) => Alarm.fromJson(e as Map<String, dynamic>))
+        .toList();
+    list.sort((a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute));
+    alarms.value = list;
+  }
+
+  Future<void> saveAlarms() async {
+    final prefs = await SharedPreferences.getInstance();
+    final encoded = jsonEncode(alarms.value.map((a) => a.toJson()).toList());
+    await prefs.setString(_alarmsPrefsKey, encoded);
+  }
+
+  Future<void> _rearmEnabledAlarms() async {
+    for (final alarm in alarms.value.where((a) => a.enabled)) {
+      await _scheduleOneShot(alarm);
+    }
+  }
+
+  Future<bool> _requestAlarmPermissions() async {
+    final exactStatus = await Permission.scheduleExactAlarm.status;
+    if (!exactStatus.isGranted) {
+      await Permission.scheduleExactAlarm.request();
+    }
+    if (await Permission.notification.isDenied) {
+      await Permission.notification.request();
+    }
+    await _notifications
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestFullScreenIntentPermission();
+    return await Permission.scheduleExactAlarm.isGranted;
+  }
+
+  Future<void> scheduleAlarm(Alarm alarm) async {
+    await _requestAlarmPermissions();
+    await _scheduleOneShot(alarm);
+  }
+
+  Future<void> _scheduleOneShot(Alarm alarm) async {
+    final triggerAt = alarm.nextTriggerTime();
+    await AndroidAlarmManager.oneShotAt(
+      triggerAt,
+      alarm.id,
+      alarmCallback,
+      exact: true,
+      wakeup: true,
+      allowWhileIdle: true,
+      alarmClock: true,
+      rescheduleOnReboot: true,
+      params: alarm.toJson(),
+    );
+  }
+
+  Future<void> cancelAlarm(int id) async {
+    await AndroidAlarmManager.cancel(id);
+    await AndroidAlarmManager.cancel(id + 1000000); // snooze id
+    await _notifications.cancel(id: id);
+  }
+
+  Future<void> upsertAlarm(Alarm alarm) async {
+    final list = [...alarms.value];
+    final idx = list.indexWhere((a) => a.id == alarm.id);
+    if (idx >= 0) {
+      list[idx] = alarm;
+    } else {
+      list.add(alarm);
+    }
+    list.sort((a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute));
+    alarms.value = list;
+    await saveAlarms();
+
+    if (alarm.enabled) {
+      await scheduleAlarm(alarm);
+    } else {
+      await cancelAlarm(alarm.id);
+    }
+  }
+
+  Future<void> toggleAlarm(Alarm alarm, bool enabled) async {
+    await upsertAlarm(alarm.copyWith(enabled: enabled));
+  }
+
+  Future<void> deleteAlarm(int id) async {
+    await cancelAlarm(id);
+    alarms.value = alarms.value.where((a) => a.id != id).toList();
+    await saveAlarms();
+  }
+
+  (Alarm, DateTime)? nextEnabledAlarm() {
+    final enabled = alarms.value.where((a) => a.enabled).toList();
+    if (enabled.isEmpty) return null;
+    final now = DateTime.now();
+    Alarm? best;
+    DateTime? bestTime;
+    for (final a in enabled) {
+      final t = a.nextTriggerTime(now);
+      if (bestTime == null || t.isBefore(bestTime)) {
+        best = a;
+        bestTime = t;
+      }
+    }
+    if (best == null || bestTime == null) return null;
+    return (best, bestTime);
+  }
+
+  Future<void> startRinging(Alarm alarm) async {
+    ringingAlarm.value = alarm;
+    _navKey?.currentState?.pushNamed('/ring');
+
+    _fadeTimer?.cancel();
+    _vibrateTimer?.cancel();
+
+    try {
+      await _ringPlayer.stop();
+      if (alarm.soundPath != null) {
+        await _ringPlayer.setAudioSource(AudioSource.file(alarm.soundPath!));
+      } else {
+        await _ringPlayer.setAudioSource(
+          AudioSource.uri(Uri.parse('content://settings/system/alarm_alert')),
+        );
+      }
+      await _ringPlayer.setLoopMode(LoopMode.one);
+      if (alarm.fadeIn) {
+        double vol = 0.05;
+        await _ringPlayer.setVolume(vol);
+        _fadeTimer = Timer.periodic(const Duration(seconds: 1), (t) async {
+          vol = (vol + (0.95 / 30)).clamp(0.05, 1.0);
+          await _ringPlayer.setVolume(vol);
+          if (vol >= 1.0) t.cancel();
+        });
+      } else {
+        await _ringPlayer.setVolume(1.0);
+      }
+      await _ringPlayer.play();
+    } catch (_) {
+      // Fallback: notification channel alarm sound still rings.
+    }
+
+    if (alarm.vibrate) {
+      _vibrateTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        HapticFeedback.vibrate();
+      });
+    }
+  }
+
+  Future<void> stopRinging() async {
+    final alarm = ringingAlarm.value;
+    _fadeTimer?.cancel();
+    _vibrateTimer?.cancel();
+    await _ringPlayer.stop();
+    if (alarm != null) {
+      await _notifications.cancel(id: alarm.id);
+      if (alarm.repeatDays.isEmpty) {
+        await upsertAlarm(alarm.copyWith(enabled: false));
+      } else {
+        await _scheduleOneShot(alarm);
+      }
+    }
+    ringingAlarm.value = null;
+    if (_navKey?.currentState?.canPop() ?? false) {
+      _navKey?.currentState?.pop();
+    }
+  }
+
+  Future<void> snoozeRinging() async {
+    final alarm = ringingAlarm.value;
+    _fadeTimer?.cancel();
+    _vibrateTimer?.cancel();
+    await _ringPlayer.stop();
+    if (alarm != null) {
+      await _notifications.cancel(id: alarm.id);
+      final snoozeTime =
+          DateTime.now().add(Duration(minutes: alarm.snoozeMinutes));
+      await AndroidAlarmManager.oneShotAt(
+        snoozeTime,
+        alarm.id + 1000000,
+        alarmCallback,
+        exact: true,
+        wakeup: true,
+        allowWhileIdle: true,
+        alarmClock: true,
+        params: alarm.toJson(),
+      );
+    }
+    ringingAlarm.value = null;
+    if (_navKey?.currentState?.canPop() ?? false) {
+      _navKey?.currentState?.pop();
+    }
+  }
+}
+````
+--------------------------------------------------------------------------------
+
+screens/library_screen.dart
+````text
+import 'dart:io';
+
+import 'package:audio_metadata_reader/audio_metadata_reader.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../core/audio_handler.dart';
+import '../core/models.dart';
+
+const String _foldersPrefsKey = 'music_folders_v1';
+const String _settingsPrefsKey = 'app_settings_v1';
+const Set<String> _supportedExts = {
+  '.mp3',
+  '.m4a',
+  '.aac',
+  '.flac',
+  '.ogg',
+  '.wav',
+  '.opus',
+};
+
+class LibraryScreen extends StatefulWidget {
+  const LibraryScreen({super.key});
+
+  @override
+  State<LibraryScreen> createState() => _LibraryScreenState();
+}
+
+class _LibraryScreenState extends State<LibraryScreen> {
+  List<String> _folders = [];
+  bool _scanning = false;
+  String _search = '';
+  LibrarySort _sort = LibrarySort.title;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadFoldersAndScan();
+  }
+
+  Future<void> _loadFoldersAndScan() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getStringList(_foldersPrefsKey) ?? [];
+    setState(() => _folders = saved);
+    if (saved.isNotEmpty) {
+      await _scanFolders();
+    }
+  }
+
+  Future<bool> _requestAudioPermission() async {
+    if (await Permission.audio.isGranted || await Permission.storage.isGranted) {
+      return true;
+    }
+    final audioStatus = await Permission.audio.request();
+    if (audioStatus.isGranted) return true;
+    final storageStatus = await Permission.storage.request();
+    return storageStatus.isGranted;
+  }
+
+  Future<void> _addFolder() async {
+    final granted = await _requestAudioPermission();
+    if (!granted && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Audio storage permission is needed.')),
+      );
+      return;
+    }
+
+    final path = await FilePicker.getDirectoryPath();
+    if (path == null) return;
+    if (_folders.contains(path)) return;
+
+    final updated = [..._folders, path];
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_foldersPrefsKey, updated);
+    setState(() => _folders = updated);
+    await _scanFolders();
+  }
+
+  Future<void> _removeFolder(String path) async {
+    final updated = _folders.where((f) => f != path).toList();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_foldersPrefsKey, updated);
+    setState(() => _folders = updated);
+    await _scanFolders();
+  }
+
+  Future<void> _scanFolders() async {
+    setState(() => _scanning = true);
+    final List<Track> found = [];
+    final Set<String> seenPaths = {};
+
+    for (final folder in _folders) {
+      final dir = Directory(folder);
+      if (!await dir.exists()) continue;
+      try {
+        await for (final entity in dir.list(recursive: true, followLinks: false)) {
+          if (entity is! File) continue;
+          final lower = entity.path.toLowerCase();
+          final ok = _supportedExts.any((ext) => lower.endsWith(ext));
+          if (!ok || seenPaths.contains(entity.path)) continue;
+          seenPaths.add(entity.path);
+
+          final fileName = entity.uri.pathSegments.last;
+          final fallbackTitle = fileName.contains('.')
+              ? fileName.substring(0, fileName.lastIndexOf('.'))
+              : fileName;
+
+          String title = fallbackTitle;
+          String artist = 'Unknown Artist';
+          String album = 'Unknown Album';
+          int durationMs = 0;
+          int modifiedMs = 0;
+
+          try {
+            final stat = await entity.stat();
+            modifiedMs = stat.modified.millisecondsSinceEpoch;
+            final meta = readMetadata(entity, getImage: false);
+            if ((meta.title ?? '').trim().isNotEmpty) {
+              title = meta.title!.trim();
+            }
+            if ((meta.artist ?? '').trim().isNotEmpty) {
+              artist = meta.artist!.trim();
+            }
+            if ((meta.album ?? '').trim().isNotEmpty) {
+              album = meta.album!.trim();
+            }
+            if (meta.duration != null) {
+              durationMs = meta.duration!.inMilliseconds;
+            }
+          } catch (_) {
+            // Unreadable tags: keep filename fallback.
+          }
+
+          found.add(Track(
+            id: entity.path,
+            path: entity.path,
+            title: title,
+            artist: artist,
+            album: album,
+            durationMs: durationMs,
+            dateAddedMs: modifiedMs,
+          ));
+        }
+      } catch (_) {
+        // Skip unreadable directory.
+      }
+    }
+
+    libraryTracks.value = found;
+    if (mounted) {
+      setState(() => _scanning = false);
+    }
+  }
+
+  List<Track> _filteredAndSorted(List<Track> all) {
+    final q = _search.trim().toLowerCase();
+    final filtered = q.isEmpty
+        ? [...all]
+        : all
+            .where((t) =>
+                t.title.toLowerCase().contains(q) ||
+                t.artist.toLowerCase().contains(q))
+            .toList();
+
+    filtered.sort((a, b) => switch (_sort) {
+          LibrarySort.title =>
+            a.title.toLowerCase().compareTo(b.title.toLowerCase()),
+          LibrarySort.artist =>
+            a.artist.toLowerCase().compareTo(b.artist.toLowerCase()),
+          LibrarySort.dateAdded => b.dateAddedMs.compareTo(a.dateAddedMs),
+        });
+    return filtered;
+  }
+
+  String _fmtDuration(Duration d) {
+    if (d <= Duration.zero) return '--:--';
+    final m = d.inMinutes;
+    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  void _showTrackMenu(Track track) {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.playlist_play),
+              title: const Text('Play next'),
+              onTap: () {
+                Navigator.pop(context);
+                audioHandler.playNext(track);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Playing "${track.title}" next')),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.queue_music),
+              title: const Text('Add to queue'),
+              onTap: () {
+                Navigator.pop(context);
+                audioHandler.addToQueue(track);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Added "${track.title}" to queue')),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openSettingsDialog() {
+    showDialog(
+      context: context,
+      builder: (_) => ValueListenableBuilder<AppSettings>(
+        valueListenable: settingsNotifier,
+        builder: (context, settings, __) => AlertDialog(
+          title: const Text('Settings'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Theme', style: TextStyle(fontWeight: FontWeight.w600)),
+                const SizedBox(height: 6),
+                SegmentedButton<ThemeMode>(
+                  segments: const [
+                    ButtonSegment(value: ThemeMode.system, label: Text('System')),
+                    ButtonSegment(value: ThemeMode.light, label: Text('Light')),
+                    ButtonSegment(value: ThemeMode.dark, label: Text('Dark')),
+                  ],
+                  selected: {settings.themeMode},
+                  onSelectionChanged: (sel) => _saveSettings(
+                    settings.copyWith(themeMode: sel.first),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<int>(
+                  value: settings.defaultSnoozeMinutes,
+                  decoration: const InputDecoration(
+                    labelText: 'Default snooze duration',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: const [5, 10, 15]
+                      .map((m) => DropdownMenuItem(value: m, child: Text('$m min')))
+                      .toList(),
+                  onChanged: (v) {
+                    if (v != null) {
+                      _saveSettings(settings.copyWith(defaultSnoozeMinutes: v));
+                    }
+                  },
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<int>(
+                  value: settings.defaultSleepMinutes,
+                  decoration: const InputDecoration(
+                    labelText: 'Default sleep timer',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: const [15, 30, 60, 120]
+                      .map((m) => DropdownMenuItem(value: m, child: Text('$m min')))
+                      .toList(),
+                  onChanged: (v) {
+                    if (v != null) {
+                      _saveSettings(settings.copyWith(defaultSleepMinutes: v));
+                    }
+                  },
+                ),
+                const SizedBox(height: 16),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    await Permission.ignoreBatteryOptimizations.request();
+                  },
+                  icon: const Icon(Icons.battery_saver),
+                  label: const Text('Disable battery optimization'),
+                ),
+                const Divider(height: 24),
+                const Text('Music & Alarm v1.0\nOffline folder player + alarms'),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveSettings(AppSettings updated) async {
+    settingsNotifier.value = updated;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _settingsPrefsKey,
+      '${updated.themeMode.index}|${updated.defaultSnoozeMinutes}|${updated.defaultSleepMinutes}',
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Library'),
+        actions: [
+          IconButton(
+            tooltip: 'Add Folder',
+            icon: const Icon(Icons.create_new_folder_outlined),
+            onPressed: _scanning ? null : _addFolder,
+          ),
+          IconButton(
+            tooltip: 'Rescan',
+            icon: const Icon(Icons.refresh),
+            onPressed: _scanning || _folders.isEmpty ? null : _scanFolders,
+          ),
+          PopupMenuButton<LibrarySort>(
+            tooltip: 'Sort',
+            icon: const Icon(Icons.sort),
+            initialValue: _sort,
+            onSelected: (s) => setState(() => _sort = s),
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: LibrarySort.title, child: Text('Sort by Title')),
+              PopupMenuItem(value: LibrarySort.artist, child: Text('Sort by Artist')),
+              PopupMenuItem(
+                value: LibrarySort.dateAdded,
+                child: Text('Sort by Date Added'),
+              ),
+            ],
+          ),
+          IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: _openSettingsDialog,
+          ),
+        ],
+      ),
+      body: ValueListenableBuilder<List<Track>>(
+        valueListenable: libraryTracks,
+        builder: (context, allTracks, _) {
+          if (_scanning) {
+            return const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 12),
+                  Text('Scanning music folders...'),
+                ],
+              ),
+            );
+          }
+
+          if (_folders.isEmpty) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.folder_open, size: 64),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'No folders added. Tap + to add music.',
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 16),
+                    FilledButton.icon(
+                      onPressed: _addFolder,
+                      icon: const Icon(Icons.add),
+                      label: const Text('Add Folder'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
+
+          final tracks = _filteredAndSorted(allTracks);
+
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: TextField(
+                  decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.search),
+                    hintText: 'Search title or artist',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  onChanged: (v) => setState(() => _search = v),
+                ),
+              ),
+              SizedBox(
+                height: 40,
+                child: ListView.separated(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  scrollDirection: Axis.horizontal,
+                  itemCount: _folders.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 8),
+                  itemBuilder: (_, i) {
+                    final folder = _folders[i];
+                    final name = folder.split('/').where((s) => s.isNotEmpty).last;
+                    return InputChip(
+                      label: Text(name),
+                      onDeleted: () => _removeFolder(folder),
+                    );
+                  },
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                child: Row(
+                  children: [
+                    Text(
+                      '${allTracks.length} songs in ${_folders.length} folders',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: tracks.isEmpty
+                    ? const Center(child: Text('No matching songs.'))
+                    : ListView.builder(
+                        itemCount: tracks.length,
+                        itemBuilder: (context, index) {
+                          final track = tracks[index];
+                          return ListTile(
+                            leading: const CircleAvatar(
+                              child: Icon(Icons.music_note),
+                            ),
+                            title: Text(
+                              track.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              '${track.artist} • ${_fmtDuration(track.duration)}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            onTap: () async {
+                              await audioHandler.setQueueAndPlay(tracks, index);
+                              if (context.mounted) {
+                                Navigator.pushNamed(context, '/player');
+                              }
+                            },
+                            onLongPress: () => _showTrackMenu(track),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+````
+--------------------------------------------------------------------------------
+
+screens/player_screen.dart
+````text
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:audio_metadata_reader/audio_metadata_reader.dart';
+import 'package:audio_service/audio_service.dart';
+import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
+
+import '../core/audio_handler.dart';
+import '../core/models.dart';
+
+class PlayerScreen extends StatefulWidget {
+  const PlayerScreen({super.key});
+
+  @override
+  State<PlayerScreen> createState() => _PlayerScreenState();
+}
+
+class _PlayerScreenState extends State<PlayerScreen> {
+  double? _dragSeconds;
+  String? _artTrackId;
+  Uint8List? _artworkBytes;
+
+  void _loadArtworkIfNeeded(MediaItem? item) {
+    if (item == null || item.id == _artTrackId) return;
+    _artTrackId = item.id;
+    final path = item.extras?['path'] as String?;
+    if (path == null) {
+      _artworkBytes = null;
+      return;
+    }
+    try {
+      final meta = readMetadata(File(path), getImage: true);
+      final bytes = meta.pictures.isNotEmpty ? meta.pictures.first.bytes : null;
+      if (mounted) setState(() => _artworkBytes = bytes);
+    } catch (_) {
+      if (mounted) setState(() => _artworkBytes = null);
+    }
+  }
+
+  String _fmt(Duration d) {
+    final h = d.inHours;
+    final m = (d.inMinutes % 60).toString().padLeft(2, '0');
+    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+
+  void _openSleepTimerSheet() {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, _) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Sleep Timer',
+                    style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 12),
+                ValueListenableBuilder<Duration?>(
+                  valueListenable: audioHandler.sleepRemaining,
+                  builder: (_, rem, __) {
+                    if (rem == null) return const SizedBox.shrink();
+                    return Card(
+                      child: ListTile(
+                        leading: const Icon(Icons.timer),
+                        title: Text('Stopping in ${_fmt(rem)}'),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            TextButton(
+                              onPressed: () => audioHandler
+                                  .extendSleepTimer(const Duration(minutes: 10)),
+                              child: const Text('+10m'),
+                            ),
+                            TextButton(
+                              onPressed: audioHandler.cancelSleepTimer,
+                              child: const Text('Cancel'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    ...SleepTimerPreset.presets.map(
+                      (p) => ActionChip(
+                        label: Text(p.label),
+                        onPressed: () {
+                          audioHandler.startSleepTimer(p.duration);
+                          Navigator.pop(context);
+                        },
+                      ),
+                    ),
+                    ActionChip(
+                      label: const Text('Custom'),
+                      onPressed: () async {
+                        Navigator.pop(context);
+                        await _pickCustomSleepMinutes();
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                ValueListenableBuilder<bool>(
+                  valueListenable: audioHandler.stopAfterCurrent,
+                  builder: (_, enabled, __) => SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Stop after current track'),
+                    value: enabled,
+                    onChanged: (_) => audioHandler.toggleStopAfterCurrent(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickCustomSleepMinutes() async {
+    final controller = TextEditingController(
+      text: settingsNotifier.value.defaultSleepMinutes.toString(),
+    );
+    final mins = await showDialog<int>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Custom Sleep Timer (minutes)'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.number,
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final v = int.tryParse(controller.text.trim());
+              Navigator.pop(context, (v != null && v > 0) ? v : null);
+            },
+            child: const Text('Start'),
+          ),
+        ],
+      ),
+    );
+    if (mins != null) {
+      audioHandler.startSleepTimer(Duration(minutes: mins));
+    }
+  }
+
+  void _openQueueSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        builder: (_, scrollController) => ValueListenableBuilder<List<Track>>(
+          valueListenable: audioHandler.currentTracks,
+          builder: (context, tracks, __) => Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(14),
+                child: Text(
+                  'Queue (${tracks.length})',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+              Expanded(
+                child: ReorderableListView.builder(
+                  scrollController: scrollController,
+                  itemCount: tracks.length,
+                  onReorder: audioHandler.reorderQueue,
+                  itemBuilder: (_, index) {
+                    final t = tracks[index];
+                    return ListTile(
+                      key: ValueKey('${t.id}_$index'),
+                      leading: const Icon(Icons.drag_handle),
+                      title: Text(t.title,
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                      subtitle: Text(t.artist,
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                      onTap: () {
+                        audioHandler.skipToQueueItem(index);
+                        Navigator.pop(context);
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Now Playing'),
+        actions: [
+          ValueListenableBuilder<Duration?>(
+            valueListenable: audioHandler.sleepRemaining,
+            builder: (_, rem, __) => IconButton(
+              tooltip: 'Sleep Timer',
+              icon: Badge(
+                isLabelVisible: rem != null,
+                label: Text(rem == null ? '' : '${rem.inMinutes + 1}m'),
+                child: const Icon(Icons.timer_outlined),
+              ),
+              onPressed: _openSleepTimerSheet,
+            ),
+          ),
+          IconButton(
+            tooltip: 'Queue',
+            icon: const Icon(Icons.queue_music),
+            onPressed: _openQueueSheet,
+          ),
+        ],
+      ),
+      body: StreamBuilder<MediaItem?>(
+        stream: audioHandler.mediaItem,
+        builder: (context, mediaSnap) {
+          final item = mediaSnap.data;
+          _loadArtworkIfNeeded(item);
+
+          if (item == null) {
+            return const Center(
+              child: Text('Nothing playing. Pick a song from Library.'),
+            );
+          }
+
+          return Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+            child: Column(
+              children: [
+                Expanded(
+                  child: Center(
+                    child: AspectRatio(
+                      aspectRatio: 1,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(20),
+                        child: _artworkBytes != null
+                            ? Image.memory(_artworkBytes!, fit: BoxFit.cover)
+                            : Container(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .surfaceContainerHighest,
+                                child: const Icon(Icons.music_note, size: 96),
+                              ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  item.title,
+                  style: Theme.of(context).textTheme.headlineSmall,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${item.artist ?? 'Unknown Artist'} • ${item.album ?? ''}',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 16),
+                StreamBuilder<Duration>(
+                  stream: audioHandler.player.positionStream,
+                  builder: (context, posSnap) {
+                    final total =
+                        audioHandler.player.duration ?? item.duration ?? Duration.zero;
+                    final pos = posSnap.data ?? Duration.zero;
+                    final maxSec = total.inSeconds.toDouble().clamp(1.0, double.infinity);
+                    final currentSec = (_dragSeconds ?? pos.inSeconds.toDouble())
+                        .clamp(0.0, maxSec);
+
+                    return Column(
+                      children: [
+                        Slider(
+                          value: currentSec,
+                          max: maxSec,
+                          onChanged: (v) => setState(() => _dragSeconds = v),
+                          onChangeEnd: (v) async {
+                            await audioHandler.seek(Duration(seconds: v.round()));
+                            if (mounted) setState(() => _dragSeconds = null);
+                          },
+                        ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(_fmt(Duration(seconds: currentSec.round()))),
+                            Text(_fmt(total)),
+                          ],
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 12),
+                StreamBuilder<PlaybackState>(
+                  stream: audioHandler.playbackState,
+                  builder: (context, stateSnap) {
+                    final playing = stateSnap.data?.playing ?? false;
+                    return Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        ValueListenableBuilder<bool>(
+                          valueListenable: audioHandler.shuffleEnabled,
+                          builder: (_, shuf, __) => IconButton(
+                            icon: Icon(
+                              Icons.shuffle,
+                              color: shuf
+                                  ? Theme.of(context).colorScheme.primary
+                                  : null,
+                            ),
+                            onPressed: audioHandler.toggleShuffle,
+                          ),
+                        ),
+                        IconButton(
+                          iconSize: 36,
+                          icon: const Icon(Icons.skip_previous),
+                          onPressed: audioHandler.skipToPrevious,
+                        ),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            shape: const CircleBorder(),
+                            padding: const EdgeInsets.all(18),
+                          ),
+                          onPressed:
+                              playing ? audioHandler.pause : audioHandler.play,
+                          child: Icon(
+                            playing ? Icons.pause : Icons.play_arrow,
+                            size: 36,
+                          ),
+                        ),
+                        IconButton(
+                          iconSize: 36,
+                          icon: const Icon(Icons.skip_next),
+                          onPressed: audioHandler.skipToNext,
+                        ),
+                        ValueListenableBuilder<LoopMode>(
+                          valueListenable: audioHandler.loopMode,
+                          builder: (_, mode, __) => IconButton(
+                            icon: Icon(
+                              mode == LoopMode.one
+                                  ? Icons.repeat_one
+                                  : Icons.repeat,
+                              color: mode != LoopMode.off
+                                  ? Theme.of(context).colorScheme.primary
+                                  : null,
+                            ),
+                            onPressed: audioHandler.cycleRepeatMode,
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 12),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+````
+--------------------------------------------------------------------------------
+
+screens/alarm_screen.dart
+````text
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+
+import '../core/alarm_service.dart';
+import '../core/models.dart';
+
+class AlarmScreen extends StatelessWidget {
+  const AlarmScreen({super.key});
+
+  String _nextBannerText(BuildContext context) {
+    final next = alarmService.nextEnabledAlarm();
+    if (next == null) return 'No upcoming alarms';
+    final (alarm, time) = next;
+    final diff = time.difference(DateTime.now());
+    final h = diff.inHours;
+    final m = diff.inMinutes % 60;
+    return 'Next alarm: ${alarm.formattedTime(context)}, in ${h}h ${m}m';
+  }
+
+  Future<void> _openEditor(BuildContext context, [Alarm? existing]) async {
+    TimeOfDay picked = existing != null
+        ? TimeOfDay(hour: existing.hour, minute: existing.minute)
+        : TimeOfDay.now();
+    final labelCtrl = TextEditingController(text: existing?.label ?? '');
+    List<int> repeatDays = [...(existing?.repeatDays ?? [])];
+    bool vibrate = existing?.vibrate ?? true;
+    int snoozeMin =
+        existing?.snoozeMinutes ?? settingsNotifier.value.defaultSnoozeMinutes;
+    bool fadeIn = existing?.fadeIn ?? true;
+    String? soundPath = existing?.soundPath;
+
+    const dayLabels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
+    final saved = await showDialog<Alarm>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(existing == null ? 'Add Alarm' : 'Edit Alarm'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: TextButton(
+                    onPressed: () async {
+                      final t = await showTimePicker(
+                        context: context,
+                        initialTime: picked,
+                      );
+                      if (t != null) setDialogState(() => picked = t);
+                    },
+                    child: Text(
+                      picked.format(context),
+                      style: Theme.of(context).textTheme.displaySmall,
+                    ),
+                  ),
+                ),
+                TextField(
+                  controller: labelCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Label (optional)',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Text('Repeat'),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 6,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('Once'),
+                      selected: repeatDays.isEmpty,
+                      onSelected: (_) => setDialogState(() => repeatDays = []),
+                    ),
+                    ChoiceChip(
+                      label: const Text('Daily'),
+                      selected: repeatDays.length == 7,
+                      onSelected: (_) =>
+                          setDialogState(() => repeatDays = [1, 2, 3, 4, 5, 6, 7]),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 4,
+                  children: List.generate(7, (i) {
+                    final day = i + 1;
+                    final selected = repeatDays.contains(day);
+                    return FilterChip(
+                      label: Text(dayLabels[i]),
+                      selected: selected,
+                      onSelected: (v) {
+                        setDialogState(() {
+                          if (v) {
+                            repeatDays.add(day);
+                          } else {
+                            repeatDays.remove(day);
+                          }
+                        });
+                      },
+                    );
+                  }),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Vibrate'),
+                  value: vibrate,
+                  onChanged: (v) => setDialogState(() => vibrate = v),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Fade-in volume (30s)'),
+                  value: fadeIn,
+                  onChanged: (v) => setDialogState(() => fadeIn = v),
+                ),
+                DropdownButtonFormField<int>(
+                  value: snoozeMin,
+                  decoration: const InputDecoration(
+                    labelText: 'Snooze duration',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  items: const [5, 10, 15]
+                      .map((m) => DropdownMenuItem(value: m, child: Text('$m min')))
+                      .toList(),
+                  onChanged: (v) {
+                    if (v != null) setDialogState(() => snoozeMin = v);
+                  },
+                ),
+                const SizedBox(height: 12),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Sound'),
+                  subtitle: Text(
+                    soundPath == null
+                        ? 'Default alarm'
+                        : soundPath!.split('/').last,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: TextButton(
+                    onPressed: () async {
+                      final chosen = await _pickSoundDialog(context, soundPath);
+                      if (chosen != null) {
+                        setDialogState(
+                          () => soundPath = chosen.isEmpty ? null : chosen,
+                        );
+                      }
+                    },
+                    child: const Text('Choose'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final id = existing?.id ??
+                    (DateTime.now().millisecondsSinceEpoch % 100000000);
+                Navigator.pop(
+                  context,
+                  Alarm(
+                    id: id,
+                    hour: picked.hour,
+                    minute: picked.minute,
+                    label: labelCtrl.text.trim(),
+                    enabled: true,
+                    repeatDays: repeatDays,
+                    vibrate: vibrate,
+                    snoozeMinutes: snoozeMin,
+                    fadeIn: fadeIn,
+                    soundPath: soundPath,
+                  ),
+                );
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (saved != null) {
+      await alarmService.upsertAlarm(saved);
+    }
+  }
+
+  Future<String?> _pickSoundDialog(BuildContext context, String? current) {
+    final tracks = libraryTracks.value;
+    return showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Alarm Sound'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 300,
+          child: ListView(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.alarm),
+                title: const Text('Default alarm'),
+                selected: current == null,
+                onTap: () => Navigator.pop(context, ''),
+              ),
+              const Divider(),
+              if (tracks.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: Text('Scan music folders in Library to pick a song.'),
+                )
+              else
+                ...tracks.map(
+                  (t) => ListTile(
+                    leading: const Icon(Icons.music_note),
+                    title: Text(t.title,
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    subtitle: Text(t.artist,
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    selected: current == t.path,
+                    onTap: () => Navigator.pop(context, t.path),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Alarms')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _openEditor(context),
+        icon: const Icon(Icons.add_alarm),
+        label: const Text('Add Alarm'),
+      ),
+      body: ValueListenableBuilder<List<Alarm>>(
+        valueListenable: alarmService.alarms,
+        builder: (context, list, _) {
+          return Column(
+            children: [
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Text(
+                  _nextBannerText(context),
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+              Expanded(
+                child: list.isEmpty
+                    ? const Center(child: Text('No alarms set. Tap + to add one.'))
+                    : ListView.builder(
+                        itemCount: list.length,
+                        itemBuilder: (context, index) {
+                          final alarm = list[index];
+                          return Dismissible(
+                            key: ValueKey(alarm.id),
+                            direction: DismissDirection.endToStart,
+                            background: Container(
+                              color: Colors.red,
+                              alignment: Alignment.centerRight,
+                              padding: const EdgeInsets.only(right: 20),
+                              child: const Icon(Icons.delete, color: Colors.white),
+                            ),
+                            onDismissed: (_) => alarmService.deleteAlarm(alarm.id),
+                            child: ListTile(
+                              title: Text(
+                                alarm.formattedTime(context),
+                                style: Theme.of(context).textTheme.headlineSmall,
+                              ),
+                              subtitle: Text(
+                                '${alarm.label.isEmpty ? 'Alarm' : alarm.label} • ${alarm.repeatSummary}',
+                              ),
+                              trailing: Switch(
+                                value: alarm.enabled,
+                                onChanged: (v) =>
+                                    alarmService.toggleAlarm(alarm, v),
+                              ),
+                              onTap: () => _openEditor(context, alarm),
+                              onLongPress: () =>
+                                  alarmService.deleteAlarm(alarm.id),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class AlarmRingingScreen extends StatefulWidget {
+  const AlarmRingingScreen({super.key});
+
+  @override
+  State<AlarmRingingScreen> createState() => _AlarmRingingScreenState();
+}
+
+class _AlarmRingingScreenState extends State<AlarmRingingScreen> {
+  late Timer _clockTimer;
+  DateTime _now = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => _now = DateTime.now());
+    });
+  }
+
+  @override
+  void dispose() {
+    _clockTimer.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Alarm?>(
+      valueListenable: alarmService.ringingAlarm,
+      builder: (context, alarm, _) {
+        final timeStr = TimeOfDay.fromDateTime(_now).format(context);
+        final snoozeMin = alarm?.snoozeMinutes ?? 10;
+        return Scaffold(
+          backgroundColor: Theme.of(context).colorScheme.surface,
+          body: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const SizedBox(height: 24),
+                  Column(
+                    children: [
+                      const Icon(Icons.alarm_on, size: 72),
+                      const SizedBox(height: 16),
+                      Text(
+                        timeStr,
+                        style: Theme.of(context).textTheme.displayLarge,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        (alarm?.label.isNotEmpty ?? false)
+                            ? alarm!.label
+                            : 'Alarm',
+                        style: Theme.of(context).textTheme.headlineSmall,
+                      ),
+                    ],
+                  ),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 18),
+                        ),
+                        onPressed: alarmService.stopRinging,
+                        icon: const Icon(Icons.stop),
+                        label: const Text('STOP', style: TextStyle(fontSize: 18)),
+                      ),
+                      const SizedBox(height: 14),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                        ),
+                        onPressed: alarmService.snoozeRinging,
+                        icon: const Icon(Icons.snooze),
+                        label: Text(
+                          'SNOOZE ($snoozeMin min)',
+                          style: const TextStyle(fontSize: 16),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+````
+--------------------------------------------------------------------------------
+
+screens/main_navigation.dart
+````text
+import 'package:flutter/material.dart';
+import 'alarm_screen.dart';
+import 'library_screen.dart';
+import 'player_screen.dart';
+
+class MainNavigation extends StatefulWidget {
+  const MainNavigation({super.key});
+
+  @override
+  State<MainNavigation> createState() => _MainNavigationState();
+}
+
+class _MainNavigationState extends State<MainNavigation> {
+  int _currentIndex = 0;
+
+  final List<Widget> _screens = [
+    const AlarmScreen(),
+    const LibraryScreen(),
+    const PlayerScreen(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: _screens[_currentIndex],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _currentIndex,
+        onDestinationSelected: (index) {
+          setState(() {
+            _currentIndex = index;
+          });
+        },
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.alarm), label: 'Alarms'),
+          NavigationDestination(icon: Icon(Icons.library_music), label: 'Library'),
+          NavigationDestination(icon: Icon(Icons.play_circle), label: 'Player'),
+        ],
+      ),
+    );
+  }
+}
+````
+--------------------------------------------------------------------------------
+
