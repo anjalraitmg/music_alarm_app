@@ -2,12 +2,14 @@ import 'package:flutter/material.dart';
 import 'main.dart';
 import 'core/models.dart';
 import 'screens/main_navigation.dart';
-import 'screens/alarm_screen.dart';
-import 'screens/player_screen.dart';
 import 'screens/alarm_ringing_screen.dart';
+import 'screens/player_screen.dart';
+import 'screens/welcome_screen.dart';
 
 class MusicAlarmApp extends StatelessWidget {
-  const MusicAlarmApp({super.key});
+  final String initialRoute;
+
+  const MusicAlarmApp({super.key, required this.initialRoute});
 
   @override
   Widget build(BuildContext context) {
@@ -19,22 +21,18 @@ class MusicAlarmApp extends StatelessWidget {
           navigatorKey: navigatorKey,
           debugShowCheckedModeBanner: false,
           theme: ThemeData(
-            colorScheme: ColorScheme.fromSeed(
-              seedColor: Colors.deepPurple,
-              brightness: Brightness.light,
-            ),
+            colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple, brightness: Brightness.light),
             useMaterial3: true,
           ),
           darkTheme: ThemeData(
-            colorScheme: ColorScheme.fromSeed(
-              seedColor: Colors.deepPurple,
-              brightness: Brightness.dark,
-            ),
+            colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple, brightness: Brightness.dark),
             useMaterial3: true,
           ),
-          themeMode: settings.themeMode, // <-- Dynamic theme
-          home: const MainNavigation(),
+          themeMode: settings.themeMode,
+          initialRoute: initialRoute,
           routes: {
+            '/': (context) => const MainNavigation(),
+            '/welcome': (context) => const WelcomeScreen(),
             '/ring': (context) => const AlarmRingingScreen(),
             '/player': (context) => const PlayerScreen(),
           },

@@ -1,5 +1,12 @@
-package com.example.music_alarm_app // match your applicationId package
+package com.example.music_alarm_app
 
 import com.ryanheise.audioservice.AudioServiceActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugins.GeneratedPluginRegistrant
 
-class MainActivity : AudioServiceActivity()
+class MainActivity: AudioServiceActivity() {
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        GeneratedPluginRegistrant.registerWith(flutterEngine)
+    }
+}
