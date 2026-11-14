@@ -7,9 +7,16 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'models.dart';
 
+import 'package:audio_session/audio_session.dart';
+
 late final AppAudioHandler audioHandler;
 
 Future<void> initAudioHandler() async {
+  // 1. Configure the audio session for music playback
+  final session = await AudioSession.instance;
+  await session.configure(AudioSessionConfiguration.music());
+
+  // 2. Initialize the AudioService
   audioHandler = await AudioService.init(
     builder: () => AppAudioHandler(),
     config: const AudioServiceConfig(
@@ -17,9 +24,11 @@ Future<void> initAudioHandler() async {
       androidNotificationChannelName: 'Music Playback',
       androidNotificationOngoing: true,
       androidStopForegroundOnPause: true,
+      androidNotificationIcon: 'drawable/ic_stat_music', 
     ),
   );
 }
+
 
 class AppAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final AudioPlayer player = AudioPlayer();
